@@ -164,3 +164,41 @@ class ContrastiveFusion(nn.Module):
         if "no_image_token" in checkpoint:
             self.no_image_token.data = checkpoint["no_image_token"]
         print(f"Loaded projection layers from {path}")
+
+
+class TextOnlyClassifier(nn.Module):
+    """BioBERT-only baseline for ablation."""
+    def __init__(self, biobert_name: str = "dmis-lab/biobert-base-cased-v1.1", 
+                 hidden_dim: int = 768, dropout: float = 0.1):
+        super().__init__()
+        self.biobert = BertModel.from_pretrained(biobert_name)
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+        
+    def forward(self, input_ids, attention_mask, pixel_values=None, return_components=False):
+        outputs = self.biobert(input_ids=input_ids, attention_mask=attention_mask)
+        cls = outputs.last_hidden_state[:, 0, :]
+        return self.classifier(cls).squeeze(-1)
+
+
+class ImageOnlyClassifier(nn.Module):
+    """ViT-only baseline for ablation."""
+    def __init__(self, vit_name: str = "google/vit-base-patch16-224",
+                 hidden_dim: int = 768, dropout: float = 0.1):
+        super().__init__()
+        self.vit = ViTModel.from_pretrained(vit_name)
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+        
+    def forward(self, input_ids=None, attention_mask=None, pixel_values=None, return_components=False):
+        outputs = self.vit(pixel_values=pixel_values)
+        cls = outputs.last_hidden_state[:, 0, :]
+        return self.classifier(cls).squeeze(-1)
