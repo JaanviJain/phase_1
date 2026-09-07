@@ -1,0 +1,23 @@
+{
+  "timestamp": "2026-08-13T16:46:25.148986",
+  "experiments": {
+    "frozen_concat_baseline": {
+      "success": false,
+      "test_metrics": {}
+    },
+    "unfrozen_concat": {
+      "success": false,
+      "test_metrics": {}
+    },
+    "unfrozen_cross_attn": {
+      "success": false,
+      "test_metrics": {}
+    },
+    "unfrozen_bilinear": {
+      "success": false,
+      "test_metrics": {}
+    }
+  },
+  "best_experiment": "",
+  "best_f1": -1.0
+}
