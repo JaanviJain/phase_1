@@ -19,8 +19,11 @@ from sklearn.metrics import (
 )
 
 from src.config import load_config
-from src.models import ContrastiveFusion
-from src.dataset import TripletDataset, BinaryMMDataset, collate_fn_contrastive, collate_fn_binary
+from src.models import ContrastiveFusion, TextOnlyClassifier, ImageOnlyClassifier
+from src.dataset import (
+    TripletDataset, BinaryMMDataset, TextOnlyDataset, ImageOnlyDataset,
+    collate_fn_contrastive, collate_fn_binary, collate_fn_text_only, collate_fn_image_only
+)
 from src.losses import FocalLoss, ContrastiveLoss
 from src.transforms import get_train_transforms, get_val_transforms
 from src.utils import (
@@ -30,22 +33,37 @@ from src.utils import (
 
 
 def build_model(cfg):
-    model = ContrastiveFusion(
-        biobert_name=cfg.model.biobert,
-        vit_name=cfg.model.vit,
-        fusion_type=cfg.model.fusion_type,
-        hidden_dim=cfg.model.hidden_dim,
-        dropout=cfg.model.dropout,
-    )
-    if cfg.model.freeze_biobert:
-        freeze_backbone(model.biobert, "biobert")
+    if cfg.training.mode == "text_only":
+        model = TextOnlyClassifier(
+            biobert_name=cfg.model.biobert,
+            hidden_dim=cfg.model.hidden_dim,
+            dropout=cfg.model.dropout,
+        )
+        print(f"[TextOnly] Trainable parameters: {count_parameters(model):,}")
+    elif cfg.training.mode == "image_only":
+        model = ImageOnlyClassifier(
+            vit_name=cfg.model.vit,
+            hidden_dim=cfg.model.hidden_dim,
+            dropout=cfg.model.dropout,
+        )
+        print(f"[ImageOnly] Trainable parameters: {count_parameters(model):,}")
     else:
-        unfreeze_top_layers(model.biobert, "biobert", cfg.model.unfreeze_biobert_top_n)
-    if cfg.model.freeze_vit:
-        freeze_backbone(model.vit, "vit")
-    else:
-        unfreeze_top_layers(model.vit, "vit", cfg.model.unfreeze_vit_top_n)
-    print(f"nTrainable parameters: {count_parameters(model):,}")
+        model = ContrastiveFusion(
+            biobert_name=cfg.model.biobert,
+            vit_name=cfg.model.vit,
+            fusion_type=cfg.model.fusion_type,
+            hidden_dim=cfg.model.hidden_dim,
+            dropout=cfg.model.dropout,
+        )
+        if cfg.model.freeze_biobert:
+            freeze_backbone(model.biobert, "biobert")
+        else:
+            unfreeze_top_layers(model.biobert, "biobert", cfg.model.unfreeze_biobert_top_n)
+        if cfg.model.freeze_vit:
+            freeze_backbone(model.vit, "vit")
+        else:
+            unfreeze_top_layers(model.vit, "vit", cfg.model.unfreeze_vit_top_n)
+        print(f"[Multimodal] Trainable parameters: {count_parameters(model):,}")
     return model
 
 
@@ -65,6 +83,29 @@ def build_dataloaders(cfg, tokenizer):
             tokenizer, get_val_transforms(),
         )
         collate_fn = collate_fn_contrastive
+    elif mode == "text_only":
+        train_ds = TextOnlyDataset(
+            os.path.join(cfg.data.processed_dir, "train_multimodal.csv"), tokenizer
+        )
+        val_ds = TextOnlyDataset(
+            os.path.join(cfg.data.processed_dir, "val_multimodal.csv"), tokenizer
+        )
+        test_ds = TextOnlyDataset(
+            os.path.join(cfg.data.processed_dir, "test_multimodal.csv"), tokenizer
+        )
+        collate_fn = collate_fn_text_only
+    elif mode == "image_only":
+        train_ds = ImageOnlyDataset(
+            os.path.join(cfg.data.processed_dir, "train_multimodal.csv"),
+            get_train_transforms(cfg.training.use_augmentation),
+        )
+        val_ds = ImageOnlyDataset(
+            os.path.join(cfg.data.processed_dir, "val_multimodal.csv"), get_val_transforms()
+        )
+        test_ds = ImageOnlyDataset(
+            os.path.join(cfg.data.processed_dir, "test_multimodal.csv"), get_val_transforms()
+        )
+        collate_fn = collate_fn_image_only
     else:
         train_ds = BinaryMMDataset(
             os.path.join(cfg.data.processed_dir, "train_multimodal.csv"),
@@ -80,11 +121,8 @@ def build_dataloaders(cfg, tokenizer):
         )
         collate_fn = collate_fn_binary
     
-    # ============================================================
-    # FIX: WeightedRandomSampler for balanced batches
-    # ============================================================
-    if mode == "binary":
-        # Count Fake (1.0) vs Real (0.0) in training set
+    # WeightedRandomSampler for balanced batches (binary, text_only, image_only)
+    if mode in ("binary", "text_only", "image_only"):
         fake_count = 0
         real_count = 0
         for idx in range(len(train_ds)):
@@ -95,21 +133,16 @@ def build_dataloaders(cfg, tokenizer):
                 real_count += 1
         
         total = fake_count + real_count
-        print(f"n[WeightedSampler] Train set: Fake={fake_count}, Real={real_count}")
+        print(f"\n[WeightedSampler] Train set: Fake={fake_count}, Real={real_count}")
         
-        # Weight: rare class gets high weight, common class gets weight=1
         weight_for_fake = total / (2.0 * fake_count) if fake_count > 0 else 1.0
         weight_for_real = total / (2.0 * real_count) if real_count > 0 else 1.0
-        
         print(f"[WeightedSampler] Sample weights: Fake={weight_for_fake:.2f}, Real={weight_for_real:.2f}")
         
         sample_weights = []
         for idx in range(len(train_ds)):
             label = train_ds[idx]["y"].item()
-            if label == 1.0:
-                sample_weights.append(weight_for_fake)
-            else:
-                sample_weights.append(weight_for_real)
+            sample_weights.append(weight_for_fake if label == 1.0 else weight_for_real)
         
         sampler = WeightedRandomSampler(
             weights=torch.tensor(sample_weights, dtype=torch.double),
@@ -119,7 +152,7 @@ def build_dataloaders(cfg, tokenizer):
         
         train_loader = DataLoader(
             train_ds, batch_size=cfg.training.batch_size, 
-            sampler=sampler,  # NO shuffle when using sampler
+            sampler=sampler,
             num_workers=cfg.system.num_workers, pin_memory=cfg.system.pin_memory,
             collate_fn=collate_fn, drop_last=True,
         )
@@ -203,10 +236,18 @@ def train_epoch_binary(model, loader, optimizer, criterion, device, scaler, cfg,
     all_labels = []
     pbar = tqdm(loader, desc=f"Epoch {epoch} [Train]")
     for step, batch in enumerate(pbar):
-        ids = batch["ids"].to(device)
-        mask = batch["mask"].to(device)
-        pix = batch["pix"].to(device)
+        ids = batch.get("ids")
+        mask = batch.get("mask")
+        pix = batch.get("pix")
         y = batch["y"].to(device)
+        
+        if ids is not None:
+            ids = ids.to(device)
+        if mask is not None:
+            mask = mask.to(device)
+        if pix is not None:
+            pix = pix.to(device)
+            
         optimizer.zero_grad()
         with torch.cuda.amp.autocast(enabled=cfg.training.use_amp and device.type == "cuda"):
             logits = model(ids, mask, pix)
@@ -234,10 +275,7 @@ def train_epoch_binary(model, loader, optimizer, criterion, device, scaler, cfg,
     all_labels = np.array(all_labels)
     preds = (all_probs > 0.5).astype(int)
     
-    # ============================================================
-    # FIX: Debug prints to verify label distribution
-    # ============================================================
-    print(f"n[Train Epoch {epoch}] Label distribution: {dict(zip(*np.unique(all_labels, return_counts=True)))}")
+    print(f"\n[Train Epoch {epoch}] Label distribution: {dict(zip(*np.unique(all_labels, return_counts=True)))}")
     print(f"[Train Epoch {epoch}] Pred distribution:  {dict(zip(*np.unique(preds, return_counts=True)))}")
     
     train_f1 = f1_score(all_labels, preds, zero_division=0)
@@ -252,10 +290,18 @@ def validate_binary(model, loader, criterion, device, cfg):
     all_sources = []
     with torch.no_grad():
         for batch in tqdm(loader, desc="[Validate]"):
-            ids = batch["ids"].to(device)
-            mask = batch["mask"].to(device)
-            pix = batch["pix"].to(device)
+            ids = batch.get("ids")
+            mask = batch.get("mask")
+            pix = batch.get("pix")
             y = batch["y"].to(device)
+            
+            if ids is not None:
+                ids = ids.to(device)
+            if mask is not None:
+                mask = mask.to(device)
+            if pix is not None:
+                pix = pix.to(device)
+                
             logits = model(ids, mask, pix)
             loss = criterion(logits, y)
             total_loss += loss.item()
@@ -269,9 +315,8 @@ def validate_binary(model, loader, criterion, device, cfg):
     best_thresh = 0.5
     best_f1 = 0.0
     
-    # If all predictions are identical, threshold search is meaningless
     if len(np.unique(all_probs)) < 2:
-        print(f"n[WARNING] All validation predictions are identical ({all_probs[0]:.4f}). Model has not learned to separate classes.")
+        print(f"\n[WARNING] All validation predictions are identical ({all_probs[0]:.4f}).")
     else:
         for thresh in np.arange(
             cfg.evaluation.threshold_search_min,
@@ -286,9 +331,6 @@ def validate_binary(model, loader, criterion, device, cfg):
     
     val_preds = (all_probs > best_thresh).astype(int)
     
-    # ============================================================
-    # FIX: More detailed metrics including per-class F1
-    # ============================================================
     metrics = {
         "loss": total_loss / len(loader),
         "threshold": best_thresh,
@@ -299,7 +341,6 @@ def validate_binary(model, loader, criterion, device, cfg):
         "auc": roc_auc_score(all_labels, all_probs) if len(np.unique(all_labels)) > 1 else 0.0,
     }
     
-    # Per-class precision/recall
     if len(np.unique(all_labels)) == 2:
         metrics["precision_fake"] = precision_score(all_labels, val_preds, pos_label=1, zero_division=0)
         metrics["recall_fake"] = recall_score(all_labels, val_preds, pos_label=1, zero_division=0)
@@ -322,10 +363,18 @@ def test_binary(model, loader, device, threshold, cfg):
     all_sources = []
     with torch.no_grad():
         for batch in tqdm(loader, desc="[Test]"):
-            ids = batch["ids"].to(device)
-            mask = batch["mask"].to(device)
-            pix = batch["pix"].to(device)
+            ids = batch.get("ids")
+            mask = batch.get("mask")
+            pix = batch.get("pix")
             y = batch["y"].to(device)
+            
+            if ids is not None:
+                ids = ids.to(device)
+            if mask is not None:
+                mask = mask.to(device)
+            if pix is not None:
+                pix = pix.to(device)
+                
             logits = model(ids, mask, pix)
             probs = torch.sigmoid(logits).cpu().numpy()
             all_probs.extend(probs)
@@ -349,10 +398,7 @@ def test_binary(model, loader, device, threshold, cfg):
             source_acc[src] = accuracy_score(all_labels[mask], test_preds[mask])
     metrics["per_source"] = source_acc
     
-    # Confusion Matrix
     cm = confusion_matrix(all_labels, test_preds)
-    
-    # Classification Report
     report = classification_report(
         all_labels, test_preds,
         target_names=["Fake (0)", "Real (1)"],
@@ -366,7 +412,7 @@ def test_binary(model, loader, device, threshold, cfg):
 def main():
     parser = argparse.ArgumentParser(description="Phase 1 Multimodal Encoder Training")
     parser.add_argument("--config", default="config.yaml")
-    parser.add_argument("--mode", choices=["contrastive", "binary"])
+    parser.add_argument("--mode", choices=["contrastive", "binary", "text_only", "image_only"])
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--batch_size", type=int)
     parser.add_argument("--fusion", choices=["concat", "cross_attn", "bilinear"])
@@ -374,7 +420,7 @@ def main():
     parser.add_argument("--unfreeze_biobert", type=int)
     parser.add_argument("--unfreeze_vit", type=int)
     parser.add_argument("--resume", type=str)
-    parser.add_argument("--checkpoint_dir", type=str, help="Override checkpoint directory for this run")
+    parser.add_argument("--checkpoint_dir", type=str)
     args = parser.parse_args()
     
     cfg = load_config(args.config)
@@ -396,7 +442,6 @@ def main():
         cfg.model.freeze_vit = False
         cfg.model.unfreeze_vit_top_n = args.unfreeze_vit
     
-    # Override checkpoint dir if provided (used by run_experiments.py)
     ckpt_dir = args.checkpoint_dir if args.checkpoint_dir else cfg.logging.checkpoint_dir
     log_dir = os.path.join(ckpt_dir, "logs")
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -404,18 +449,18 @@ def main():
     
     set_seed(cfg.system.seed)
     device = torch.device(cfg.system.device if torch.cuda.is_available() else "cpu")
-    print(f"nDevice: {device}")
+    print(f"\nDevice: {device}")
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     
-    print(f"nLoading tokenizer: {cfg.model.biobert}")
+    print(f"\nLoading tokenizer: {cfg.model.biobert}")
     tokenizer = BertTokenizer.from_pretrained(cfg.model.biobert)
     
-    print(f"nBuilding dataloaders (mode={cfg.training.mode})...")
+    print(f"\nBuilding dataloaders (mode={cfg.training.mode})...")
     train_loader, val_loader, test_loader = build_dataloaders(cfg, tokenizer)
     
-    print(f"nBuilding model (fusion={cfg.model.fusion_type})...")
+    print(f"\nBuilding model (fusion={getattr(cfg.model, 'fusion_type', 'N/A')})...")
     model = build_model(cfg).to(device)
     
     optimizer = torch.optim.AdamW(
@@ -432,11 +477,6 @@ def main():
     if cfg.training.mode == "contrastive":
         criterion = ContrastiveLoss(margin=cfg.training.contrastive_margin)
     else:
-        # ============================================================
-        # FIX: Compute pos_weight from actual training data
-        # Then pass it to FocalLoss
-        # ============================================================
-        # We need to peek at the train_loader dataset to count classes
         train_dataset = train_loader.dataset
         fake_count = 0
         real_count = 0
@@ -447,17 +487,14 @@ def main():
             else:
                 real_count += 1
         
-        # pos_weight = num_neg / num_pos = Real / Fake
-        # If Fake is 10x rarer, pos_weight = 10.0
         if fake_count > 0:
             pos_weight_value = real_count / fake_count
         else:
             pos_weight_value = 1.0
         
         pos_weight_tensor = torch.tensor([pos_weight_value], dtype=torch.float32).to(device)
-        print(f"n[Loss Setup] Fake={fake_count}, Real={real_count}")
-        print(f"[Loss Setup] pos_weight (Real/Fake ratio) = {pos_weight_value:.2f}")
-        print(f"[Loss Setup] This means missing a Fake sample is penalized {pos_weight_value:.1f}x more than missing a Real sample.")
+        print(f"\n[Loss Setup] Fake={fake_count}, Real={real_count}")
+        print(f"[Loss Setup] pos_weight = {pos_weight_value:.2f}")
         
         criterion = FocalLoss(
             alpha=cfg.training.focal_alpha, 
@@ -482,11 +519,13 @@ def main():
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_epoch = checkpoint.get("epoch", 0) + 1
         best_val_f1 = checkpoint.get("metrics", {}).get("f1", 0.0)
-        print(f"nResumed from {args.resume} at epoch {start_epoch}")
+        print(f"\nResumed from {args.resume} at epoch {start_epoch}")
     
-    print("n" + "=" * 70)
+    print("\n" + "=" * 70)
     print(f"STARTING TRAINING: {cfg.training.mode.upper()} MODE")
-    print(f"Epochs: {cfg.training.epochs} | Batch: {cfg.training.batch_size} | Fusion: {cfg.model.fusion_type}")
+    print(f"Epochs: {cfg.training.epochs} | Batch: {cfg.training.batch_size}")
+    if cfg.training.mode not in ("text_only", "image_only"):
+        print(f"Fusion: {cfg.model.fusion_type}")
     print(f"Checkpoint dir: {ckpt_dir}")
     print("=" * 70)
     
@@ -498,7 +537,7 @@ def main():
                 model, train_loader, optimizer, criterion, device, scaler, cfg, epoch
             )
             val_loss = validate_contrastive(model, val_loader, criterion, device, cfg)
-            print(f"nEpoch {epoch}/{cfg.training.epochs} | Time: {time.time()-epoch_start:.1f}s")
+            print(f"\nEpoch {epoch}/{cfg.training.epochs} | Time: {time.time()-epoch_start:.1f}s")
             print(f"  Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
             writer.add_scalar("Loss/train", train_loss, epoch)
             writer.add_scalar("Loss/val", val_loss, epoch)
@@ -514,7 +553,7 @@ def main():
                 model, train_loader, optimizer, criterion, device, scaler, cfg, epoch
             )
             val_metrics = validate_binary(model, val_loader, criterion, device, cfg)
-            print(f"nEpoch {epoch}/{cfg.training.epochs} | Time: {time.time()-epoch_start:.1f}s")
+            print(f"\nEpoch {epoch}/{cfg.training.epochs} | Time: {time.time()-epoch_start:.1f}s")
             print(f"  Train Loss: {train_loss:.4f} | Train F1: {train_f1:.4f}")
             print(f"  Val Loss:   {val_metrics['loss']:.4f} | Val F1: {val_metrics['f1']:.4f} (thresh={val_metrics['threshold']:.2f})")
             print(f"  Val Acc:    {val_metrics['accuracy']:.4f} | Val AUC: {val_metrics['auc']:.4f}")
@@ -534,12 +573,12 @@ def main():
                 best_threshold = val_metrics["threshold"]
                 save_checkpoint(
                     model, optimizer, epoch, val_metrics,
-                    os.path.join(ckpt_dir, f"best_binary_{run_name}.pt"),
+                    os.path.join(ckpt_dir, f"best_{cfg.training.mode}_{run_name}.pt"),
                     is_best=True,
                 )
             
             if early_stop(val_metrics["f1"]):
-                print(f"nEarly stopping triggered at epoch {epoch}")
+                print(f"\nEarly stopping triggered at epoch {epoch}")
                 break
         
         if epoch % cfg.logging.save_every_n_epochs == 0:
@@ -551,9 +590,8 @@ def main():
     
     writer.close()
     
-    # Final test evaluation
-    if cfg.training.mode == "binary":
-        print("n" + "=" * 70)
+    if cfg.training.mode in ("binary", "text_only", "image_only"):
+        print("\n" + "=" * 70)
         print("FINAL TEST EVALUATION")
         print("=" * 70)
         print(f"Using best threshold: {best_threshold:.2f}")
@@ -562,36 +600,34 @@ def main():
             model, test_loader, device, best_threshold, cfg
         )
         
-        print(f"nTest Macro-F1: {test_metrics['f1']:.4f}")
+        print(f"\nTest Macro-F1: {test_metrics['f1']:.4f}")
         print_metrics(test_metrics, prefix="Test ")
         
-        print(f"nPer-source Test Accuracy:")
+        print(f"\nPer-source Test Accuracy:")
         for src, acc in test_metrics["per_source"].items():
             print(f"  {src:15s}: {acc:.4f}")
         
-        # Confusion Matrix
-        print(f"nConfusion Matrix:")
+        print(f"\nConfusion Matrix:")
         print(f"                 Predicted")
         print(f"                 Fake    Real")
         print(f"Actual Fake      {cm[0][0]:4d}    {cm[0][1]:4d}")
         print(f"Actual Real      {cm[1][0]:4d}    {cm[1][1]:4d}")
         
-        # Classification Report
-        print(f"nClassification Report:")
+        print(f"\nClassification Report:")
         print(classification_report(
             test_labels, (test_probs > best_threshold).astype(int),
             target_names=["Fake (0)", "Real (1)"],
             digits=4
         ))
         
-        # Save everything to JSON
         results = {
             "config": {
-                "fusion": cfg.model.fusion_type,
+                "mode": cfg.training.mode,
+                "fusion": getattr(cfg.model, "fusion_type", None),
                 "epochs": cfg.training.epochs,
                 "batch_size": cfg.training.batch_size,
-                "frozen_biobert": cfg.model.freeze_biobert,
-                "frozen_vit": cfg.model.freeze_vit,
+                "frozen_biobert": getattr(cfg.model, "freeze_biobert", None),
+                "frozen_vit": getattr(cfg.model, "freeze_vit", None),
             },
             "best_val_f1": best_val_f1,
             "best_threshold": best_threshold,
@@ -600,20 +636,20 @@ def main():
             "classification_report": report,
         }
         save_json(results, os.path.join(ckpt_dir, f"test_results_{run_name}.json"))
-        print(f"nSaved full results to: {os.path.join(ckpt_dir, f'test_results_{run_name}.json')}")
+        print(f"\nSaved full results to: {os.path.join(ckpt_dir, f'test_results_{run_name}.json')}")
     
-    # Save projection layers for Phase 4
-    proj_path = os.path.join(ckpt_dir, f"best_fusion_{run_name}.pt")
-    model.save_projection_layers(proj_path)
+    if cfg.training.mode == "binary":
+        proj_path = os.path.join(ckpt_dir, f"best_fusion_{run_name}.pt")
+        model.save_projection_layers(proj_path)
+        print(f"\nProjection layers for Phase 4: {proj_path}")
     
-    print("n" + "=" * 70)
+    print("\n" + "=" * 70)
     print("TRAINING COMPLETE")
-    print(f"Best checkpoint: {os.path.join(ckpt_dir, f'best_binary_{run_name}.pt')}")
-    print(f"Projection layers for Phase 4: {proj_path}")
+    if cfg.training.mode in ("binary", "text_only", "image_only"):
+        print(f"Best checkpoint: {os.path.join(ckpt_dir, f'best_{cfg.training.mode}_{run_name}.pt')}")
     print("=" * 70)
     
-    # Return metrics for experiment runner
-    if cfg.training.mode == "binary":
+    if cfg.training.mode in ("binary", "text_only", "image_only"):
         return test_metrics
     return None
 
